@@ -42,13 +42,13 @@ dumped as garbage.
 ## Images
 
 Images embedded in a document are **extracted to a temporary folder** (by
-default under `/tmp`, e.g. `/tmp/office2md-media.XXXXXX/`), and the Markdown
+default under `/tmp`, e.g. `/tmp/XXX/`), and the Markdown
 links in the output point to those real files, so they can be opened:
 
 ```console
 $ office2md report.docx
 ...
-![A red square](/tmp/office2md-media.zwHqwz/media/rId9.png)
+![A red square](/tmp/qwz/media/rId9.png)
 ...
 ```
 
