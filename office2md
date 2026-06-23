@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+#
+# office2md — print the contents of a document as text/Markdown, like `cat`.
+#
+# Usage:
+#   office2md FILE [FILE ...]
+#
+# Routing (by extension, then by content sniff for unknown extensions):
+#   * Formats pandoc reads natively (docx, odt, epub, pptx, xlsx, rtf, html,
+#     csv, rst, org, latex, mediawiki, asciidoc, ...) -> pandoc directly.
+#   * Legacy/binary office formats pandoc can't read (doc, ppt, xls, wpd,
+#     abw, odp, ods, key, numbers, ...) -> LibreOffice converts them to the
+#     matching modern format (doc->docx, ppt->pptx, xls->xlsx), then pandoc.
+#   * PDF -> pdftohtml->pandoc if available (keeps formatting), else pdftotext.
+#   * Plain text -> printed verbatim.
+#   * Unknown extensions are sniffed with file(1): text is printed verbatim,
+#     recognised document types go through LibreOffice, everything else is
+#     reported as unsupported (no garbage output).
+#
+# Embedded images are extracted to a temp folder (under $DOC2TXT_MEDIADIR,
+# default /tmp) and the printed Markdown links point to those real files.
+#
+# Environment:
+#   DOC2TXT_FORMAT    pandoc output format (default: gfm)
+#   DOC2TXT_SOFFICE   path to the libreoffice/soffice binary (autodetected)
+#   DOC2TXT_MEDIADIR  base dir for extracted images (default: $TMPDIR or /tmp)
+#
+set -euo pipefail
+
+PROG=${0##*/}
+FORMAT=${DOC2TXT_FORMAT:-gfm}
+
+# ---- extension routing tables -------------------------------------------
+
+# ext -> pandoc input format (read directly by pandoc, no LibreOffice).
+declare -A PANDOC_FMT=(
+	[docx]=docx [odt]=odt [epub]=epub [pptx]=pptx [xlsx]=xlsx [rtf]=rtf
+	[html]=html [htm]=html [xhtml]=html
+	[csv]=csv [tsv]=tsv [json]=json
+	[md]=markdown [markdown]=markdown [mkd]=markdown [mdown]=markdown
+	[rst]=rst [org]=org [textile]=textile
+	[tex]=latex [latex]=latex [ltx]=latex
+	[wiki]=mediawiki [mediawiki]=mediawiki [dokuwiki]=dokuwiki
+	[adoc]=asciidoc [asciidoc]=asciidoc [asc]=asciidoc
+	[fb2]=fb2 [ipynb]=ipynb [man]=man [muse]=muse [opml]=opml
+	[typ]=typst [typst]=typst [djot]=djot [t2t]=t2t
+	[docbook]=docbook [jats]=jats [bib]=biblatex [ris]=ris
+	[creole]=creole [haddock]=haddock [jira]=jira [pod]=pod
+)
+
+# ext -> LibreOffice target format (converted, then read by pandoc).
+declare -A LO_TARGET=(
+	[doc]=docx [dot]=docx [wpd]=docx [wps]=docx [abw]=docx [zabw]=docx
+	[sxw]=docx [stw]=docx [sdw]=docx [vor]=docx [lwp]=docx [hwp]=docx
+	[602]=docx [pages]=docx [pub]=docx [cwk]=docx
+	[ppt]=pptx [pps]=pptx [pot]=pptx [sxi]=pptx [sti]=pptx [sdd]=pptx
+	[odp]=pptx [key]=pptx [fodp]=pptx
+	[xls]=xlsx [xlt]=xlsx [sxc]=xlsx [stc]=xlsx [sdc]=xlsx [dif]=xlsx
+	[ods]=xlsx [numbers]=xlsx [fods]=xlsx [wk1]=xlsx [wks]=xlsx [dbf]=xlsx
+)
+
+# Extensions printed verbatim (no conversion).
+declare -A PLAINTEXT=(
+	[txt]=1 [text]=1 [log]=1 [me]=1
+)
+
+# -------------------------------------------------------------------------
+
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+usage() {
+	cat >&2 <<EOF
+Usage: $PROG FILE [FILE ...]
+
+Print the contents of documents as text/Markdown (like cat).
+
+Handled directly by pandoc:
+  docx odt epub pptx xlsx rtf html csv tsv md rst org latex mediawiki
+  asciidoc textile fb2 ipynb typst json ...
+Handled via LibreOffice, then pandoc:
+  doc ppt xls wpd abw sxw odp ods key numbers pages ...
+PDF is handled by pdftohtml (preferred) or pdftotext; text prints verbatim.
+Unknown types are sniffed; non-documents are reported, not dumped.
+Embedded images are extracted to a temp folder (default /tmp) and linked.
+
+Options:
+  -h, --help   show this help
+
+Environment:
+  DOC2TXT_FORMAT    pandoc output format (default: gfm)
+  DOC2TXT_SOFFICE   path to libreoffice/soffice binary
+  DOC2TXT_MEDIADIR  base dir for extracted images (default: \$TMPDIR or /tmp)
+EOF
+}
+
+# Locate the LibreOffice binary (only needed for non-pandoc formats).
+find_soffice() {
+	if [[ -n ${DOC2TXT_SOFFICE:-} ]]; then
+		printf '%s\n' "$DOC2TXT_SOFFICE"
+		return 0
+	fi
+	local c
+	for c in libreoffice soffice; do
+		if command -v "$c" >/dev/null 2>&1; then
+			command -v "$c"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# lo_convert SRC TARGET TMPDIR -> echoes path to converted file.
+# Uses an isolated user profile so it works even while LibreOffice is open.
+lo_convert() {
+	local src=$1 target=$2 tmpdir=$3 soffice
+	if ! soffice=$(find_soffice); then
+		err "LibreOffice not found; needed to convert '$src'. Set DOC2TXT_SOFFICE."
+		return 1
+	fi
+	if ! "$soffice" --headless --norestore \
+		-env:UserInstallation="file://$tmpdir/profile" \
+		--convert-to "$target" --outdir "$tmpdir" "$src" >/dev/null 2>&1; then
+		err "LibreOffice failed to convert: $src"
+		return 1
+	fi
+	local out="$tmpdir/$(basename "${src%.*}").$target"
+	if [[ ! -f $out ]]; then
+		err "expected converted file not found: $out"
+		return 1
+	fi
+	printf '%s\n' "$out"
+}
+
+# new_media_dir -> echoes a fresh, persistent directory for extracted images.
+# Lives under $DOC2TXT_MEDIADIR (default $TMPDIR or /tmp) and is *kept* when it
+# ends up containing images, so the links printed in the output stay valid.
+new_media_dir() {
+	mktemp -d "${DOC2TXT_MEDIADIR:-${TMPDIR:-/tmp}}/XXX"
+}
+
+# run_pandoc FROM_FORMAT FILE -> Markdown on stdout.
+# Embedded images are extracted to a temp folder; pandoc rewrites their links
+# to that absolute path. The folder is removed again if it stays empty.
+run_pandoc() {
+	local from=$1 file=$2 media rc=0
+	media=$(new_media_dir) || return 1
+	pandoc -f "$from" -t "$FORMAT" --extract-media="$media" -- "$file" || rc=1
+	rmdir "$media" 2>/dev/null || true
+	return $rc
+}
+
+# via_libreoffice FILE TARGET -> Markdown on stdout.
+via_libreoffice() {
+	local file=$1 target=$2 tmpdir converted pfmt rc=0
+	tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/office2md.XXXXXX") || return 1
+	if converted=$(lo_convert "$file" "$target" "$tmpdir"); then
+		pfmt=${PANDOC_FMT[$target]:-$target}
+		run_pandoc "$pfmt" "$converted" || rc=1
+	else
+		rc=1
+	fi
+	rm -rf "$tmpdir"
+	return $rc
+}
+
+# render_pdf FILE -> text/Markdown on stdout.
+# Prefers pdftohtml (keeps bold/italics and structure, rendered to Markdown by
+# pandoc); falls back to pdftotext (plain text) when pdftohtml is unavailable.
+render_pdf() {
+	local file=$1 media rc=0
+	if command -v pdftohtml >/dev/null 2>&1; then
+		# Extract to a media dir (absolute basename -> absolute <img src>),
+		# instead of -stdout, so embedded images are written out as files.
+		# -noframes: single document. (No -i, so images are kept.)
+		# sed strips pdftohtml's appended bookmark "Document Outline" block
+		# and the empty per-page <a name=N> anchors.
+		# awk drops the trailing "\" hard-break markers pandoc emits for each
+		# PDF line, and trims trailing blank lines and the final page rule.
+		media=$(new_media_dir) || return 1
+		if pdftohtml -noframes "$file" "$media/p" >/dev/null 2>&1 &&
+			[[ -f $media/p.html ]]; then
+			sed -E -e '/<a name="outline">/,/<\/body>/d' \
+				-e 's#<a name=[0-9]+></a>##g' "$media/p.html" |
+				pandoc -f html -t "$FORMAT" |
+				awk '{ l[NR] = $0 }
+				     END {
+				       n = NR
+				       while (n > 0 && (l[n] ~ /^[[:space:]]*$/ || l[n] ~ /^-{3,}$/)) n--
+				       for (i = 1; i <= n; i++) { sub(/\\$/, "", l[i]); print l[i] }
+				     }' || rc=1
+		else
+			err "pdftohtml failed to convert: $file"
+			rc=1
+		fi
+		rm -f "$media"/p.html        # drop the intermediate HTML, keep images
+		rmdir "$media" 2>/dev/null || true
+		return $rc
+	fi
+	if command -v pdftotext >/dev/null 2>&1; then
+		pdftotext -layout -- "$file" -
+		return
+	fi
+	err "PDF support needs 'pdftohtml' or 'pdftotext' (poppler-utils), not found: $file"
+	return 1
+}
+
+# Map a file(1) MIME type to a LibreOffice target, or "" if not a document.
+mime_lo_target() {
+	case $1 in
+	*presentation* | application/vnd.ms-powerpoint) echo pptx ;;
+	*spreadsheet* | application/vnd.ms-excel) echo xlsx ;;
+	application/msword | *wordprocessing* | *opendocument.text* | \
+		*opendocument.graphics* | application/rtf | text/rtf | \
+		application/vnd.ms-works | application/x-hwp | \
+		application/vnd.wordperfect | application/x-abiword | \
+		application/x-mswrite) echo docx ;;
+	*) echo "" ;;
+	esac
+}
+
+# Best-effort handling for files whose extension we don't recognise.
+sniff_route() {
+	local file=$1 ext=$2 mime target
+	if ! command -v file >/dev/null 2>&1; then
+		err "unsupported file type '${ext:+.$ext}' and file(1) unavailable: $file"
+		return 1
+	fi
+	mime=$(file -b --mime-type -- "$file" 2>/dev/null || echo application/octet-stream)
+	case $mime in
+	application/pdf)
+		render_pdf "$file"
+		return
+		;;
+	text/*)
+		cat -- "$file"
+		return
+		;;
+	esac
+	target=$(mime_lo_target "$mime")
+	if [[ -n $target ]]; then
+		via_libreoffice "$file" "$target"
+		return
+	fi
+	err "unsupported file type '${ext:+.$ext}' (mime: $mime): $file"
+	return 1
+}
+
+# Render one file to stdout.
+render() {
+	local file=$1
+	if [[ ! -e $file ]]; then
+		err "no such file: $file"
+		return 1
+	fi
+	if [[ ! -f $file ]]; then
+		err "not a regular file: $file"
+		return 1
+	fi
+
+	local base=${file##*/} ext=""
+	if [[ $base == *.* ]]; then
+		ext=${base##*.}
+		ext=${ext,,}
+	fi
+
+	if [[ $ext == pdf ]]; then
+		render_pdf "$file"
+	elif [[ -n $ext && -n ${PLAINTEXT[$ext]:-} ]]; then
+		cat -- "$file"
+	elif [[ -n $ext && -n ${PANDOC_FMT[$ext]:-} ]]; then
+		run_pandoc "${PANDOC_FMT[$ext]}" "$file"
+	elif [[ -n $ext && -n ${LO_TARGET[$ext]:-} ]]; then
+		via_libreoffice "$file" "${LO_TARGET[$ext]}"
+	else
+		sniff_route "$file" "$ext"
+	fi
+}
+
+main() {
+	local args=()
+	while [[ $# -gt 0 ]]; do
+		case $1 in
+		-h | --help)
+			usage
+			return 0
+			;;
+		--)
+			shift
+			args+=("$@")
+			break
+			;;
+		-*)
+			err "unknown option: $1"
+			usage
+			return 2
+			;;
+		*)
+			args+=("$1")
+			;;
+		esac
+		shift
+	done
+
+	if [[ ${#args[@]} -eq 0 ]]; then
+		usage
+		return 2
+	fi
+
+	if ! command -v pandoc >/dev/null 2>&1; then
+		err "pandoc not found in PATH"
+		return 1
+	fi
+
+	local rc=0 f
+	for f in "${args[@]}"; do
+		render "$f" || rc=1
+	done
+	return $rc
+}
+
+main "$@"
